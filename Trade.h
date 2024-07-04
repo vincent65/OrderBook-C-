@@ -1,6 +1,6 @@
 #pragma once
 
-#include<TradeInfo.h>
+#include "TradeInfo.h"
 
 class Trade
 {
