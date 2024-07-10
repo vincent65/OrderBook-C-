@@ -209,6 +209,19 @@ private:
         OrderPointer order_{nullptr};
         OrderPointers::iterator location_;
     };
+    struct LeveLData
+    {
+        Quantity quantity_ { };
+        Quantity count_ { };
+
+        enum class Action 
+        {
+            Add, Remove, Match,
+        };
+    };
+
+    std::unordered_map<Price, OrderBook::LeveLData> data_;
+
     std::map<Price, OrderPointers, std::greater<Price>> bids_;
     std::map<Price, OrderPointers, std::less<Price>> asks_;
     std::unordered_map<OrderId, OrderEntry> orders_;
@@ -313,7 +326,62 @@ private:
                 bids_.erase(price);
             }
         }
+        OnOrderCancelled(order);
+    }
+    //when apis are written according to events, makes code cleaner
+    void OnOrderCancelled(OrderPointer order){
+        UpdateLevelData(order->GetPrice(), order->GetInitialQuantity(), LeveLData::Action::Remove);
+    }
+    void OnOrderAdded(OrderPointer order){
+        UpdateLevelData(order->GetPrice(), order->GetInitialQuantity(), LeveLData::Action::Add);
+    }
+    void onOrderMatched(Price price, Quantity quantity, bool isFullyFilled) {
+        UpdateLevelData(price, quantity, isFullyFilled ? LeveLData::Action::Remove : LeveLData::Action::Match);
+    }
 
+    void UpdateLevelData(Price price, Quantity quantity, LeveLData::Action action) {
+        auto&data = data_[price];
+
+        data.count_ += action == LeveLData::Action::Remove ? -1 : action == LeveLData::Action::Add ? 1 : 0;
+        if(action == LeveLData::Action::Remove || action == LeveLData::Action::Match) {
+            data.quantity_ -= quantity;
+        }
+        else{
+            data.quantity_ += quantity;
+        }
+        if(data.count_ == 0) {
+            data_.erase(price);
+        }
+    }
+
+    //fill or kill
+    bool CanFullyFill(Side side, Price price, Quantity quantity) const {
+        if(!CanMatch(side, price)){
+            return false;
+        }
+        std::optional<Price> threshold;
+        if(side == Side::Buy) {
+            const auto [askPrice, _] = *asks_.begin();
+            threshold = askPrice;
+        }
+        else{
+            const auto[bidPrice, _] = *bids_.begin();
+            threshold = bidPrice;
+        }
+        
+        for (const auto& [levelPrice, levelData] : data_) {
+            if(threshold.has_value() && (side==Side::Buy && threshold.value() > levelPrice) || (side==Side::Sell && threshold.value() < levelPrice)){
+                continue;
+            }
+            if ((side == Side::Buy && threshold.value() < levelPrice) || (side == Side::Sell && threshold.value() > levelPrice)){
+                continue;
+            }
+            if(quantity <= levelData.quantity_) {
+                return true;
+            }
+            quantity -= levelData.quantity_;
+        }
+        return false;
     }
 
     bool CanMatch(Side side, Price price) const
@@ -389,6 +457,8 @@ private:
                 }
 
                 trades.push_back(Trade{TradeInfo{bid->GetOrderId(), bid->GetPrice(), quantity}, TradeInfo{ask->GetOrderId(), ask->GetPrice(), quantity}});
+                onOrderMatched(bid->GetPrice(), quantity, bid->isFilled());
+                onOrderMatched(ask->GetPrice(), quantity, ask->isFilled());
             }
         }
 
@@ -450,11 +520,14 @@ public:
             }
         }
 
-        //if we cannot fulfill the order immediately, then we have to kill the order
+        //if we cannot fulfill the order immediately, then we have to kill the order (Fill and kill)
         if (order->GetOrderType() == OrderType::FillAndKill && !CanMatch(order->GetSide(), order->GetPrice()))
         {
             return {};
         }
+        
+        //fill and kill
+        if(order->GetOrderType() == OrderType::FillAndKill && !CanFullyFill(order->GetSide(), order->GetPrice(), order->GetInitialQuantity()));
 
         OrderPointers::iterator iterator;
 
@@ -473,6 +546,8 @@ public:
 
         orders_.insert({order->GetOrderId(), OrderEntry{order, iterator}});
 
+        OnOrderAdded(order);
+
         return MatchOrders();
     }
 
@@ -484,16 +559,25 @@ public:
 
     Trades ModifyOrder(OrderModify order)
     {
-        if (orders_.find(order.GetOrderId()) == orders_.end())
+        OrderType ot;
         {
-            return {};
+            std::scoped_lock ordersLock {ordersMutex_};
+            if (orders_.find(order.GetOrderId()) == orders_.end())
+            {
+                return {};
+            }
+            const auto &[existingOrder, _] = orders_.at(order.GetOrderId());
+            ot = existingOrder->GetOrderType();
         }
-        const auto &[existingOrder, _] = orders_.at(order.GetOrderId());
+        
         CancelOrder(order.GetOrderId());
-        return AddOrder(order.ToOrderPointer(existingOrder->GetOrderType()));
+        return AddOrder(order.ToOrderPointer(ot));
     }
 
-    std::size_t Size() const { return orders_.size(); }
+    std::size_t Size() const { 
+        std::scoped_lock ordersLock {ordersMutex_};    
+        return orders_.size(); 
+    }
 
     OrderBookLevelInfos GetOrderInfos() const
     {
